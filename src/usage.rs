@@ -698,7 +698,7 @@ pub fn find_current_session_jsonl(
     }
 
     // Pick the earliest-created file after our spawn time
-    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates.sort_by_key(|a| a.1);
     candidates.into_iter().next().map(|(p, _)| p)
 }
 

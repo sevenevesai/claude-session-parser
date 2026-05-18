@@ -184,13 +184,11 @@ pub fn parse_chat_events(path: &Path) -> std::io::Result<Vec<ChatEvent>> {
 ///     (content can itself be a string or an array of text blocks).
 fn push_user_events(content: &serde_json::Value, timestamp_ms: u64, out: &mut Vec<ChatEvent>) {
     match content {
-        serde_json::Value::String(s) => {
-            if !s.is_empty() {
-                out.push(ChatEvent::UserText {
-                    timestamp_ms,
-                    text: s.clone(),
-                });
-            }
+        serde_json::Value::String(s) if !s.is_empty() => {
+            out.push(ChatEvent::UserText {
+                timestamp_ms,
+                text: s.clone(),
+            });
         }
         serde_json::Value::Array(arr) => {
             for item in arr {

@@ -1,0 +1,20 @@
+[package]
+name = "claude-session-parser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Streaming parser for Claude Code session JSONL files: token usage, chat events, and activity classification."
+repository = "https://github.com/sevenevesai/claude-session-parser"
+homepage = "https://seveneves.ai/crates"
+readme = "README.md"
+keywords = ["claude", "claude-code", "jsonl", "parser", "usage"]
+categories = ["parser-implementations", "command-line-utilities"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

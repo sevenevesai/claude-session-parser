@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn delegation_wins_over_everything() {
         let tools = ["Agent", "Edit", "Bash"];
-        let tools: Vec<&str> = tools.iter().copied().collect();
+        let tools: Vec<&str> = tools.to_vec();
         assert_eq!(
             classify(&tools, &[], Some("fix the bug"), 100),
             Activity::Delegation

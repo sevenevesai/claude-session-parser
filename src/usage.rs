@@ -9,14 +9,24 @@ use std::time::SystemTime;
 use super::activity::{classify, normalize_user_text, Activity};
 
 /// Pricing per 1M tokens (USD) by model family.
+///
+/// Anthropic bills three prompt-cache tiers off the base input rate:
+/// 5-minute cache write = 1.25× input, 1-hour cache write = 2× input,
+/// cache read = 0.1× input. `cache_write` is the 5-minute rate (Claude Code's
+/// historical default); `cache_write_1h` is the 1-hour rate. Claude Code now
+/// emits `usage.cache_creation.ephemeral_1h_input_tokens` for the 1-hour
+/// portion, so the two must be priced separately or 1h writes undercount ~38%.
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
+    /// 5-minute cache write (1.25× input).
     pub cache_write: f64,
+    /// 1-hour cache write (2× input).
+    pub cache_write_1h: f64,
 }
 
-/// Hardcoded as of 2025-02. Requires a code change + release when Anthropic updates pricing.
+/// Hardcoded as of 2026-05. Requires a code change + release when Anthropic updates pricing.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     if model.contains("opus") {
         ModelPricing {
@@ -24,6 +34,7 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             output: 25.0,
             cache_read: 0.5,
             cache_write: 6.25,
+            cache_write_1h: 10.0,
         }
     } else if model.contains("haiku") {
         ModelPricing {
@@ -31,6 +42,7 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             output: 5.0,
             cache_read: 0.1,
             cache_write: 1.25,
+            cache_write_1h: 2.0,
         }
     } else {
         // Sonnet or unknown
@@ -39,8 +51,57 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             output: 15.0,
             cache_read: 0.3,
             cache_write: 3.75,
+            cache_write_1h: 6.0,
         }
     }
+}
+
+/// Flat fee per Anthropic web-search server-tool request ($10 per 1,000 = $0.01).
+pub const WEB_SEARCH_COST_PER_REQUEST: f64 = 0.01;
+
+/// Fast-mode (research preview) cost multiplier, applied to the entire token
+/// cost line when `usage.speed == "fast"`. Fast mode is Opus-only and its
+/// premium varies by version (confirmed Anthropic pricing, 2026-05):
+/// - Opus 4.6 / 4.7 fast: 6× ($30/$150 vs $5/$25)
+/// - Opus 4.8 fast:       2× ($10/$50 vs $5/$25)
+///
+/// Caching multipliers stack on top of fast pricing, i.e. fast scales the whole
+/// per-token line (input, output, and the cache rates that derive from input).
+/// Unknown / unsupported models return 1.0 (no premium) so we never overcount
+/// on a guess — newer Opus releases default here until their multiplier is added.
+pub fn fast_multiplier_for_model(model: &str) -> f64 {
+    if model.contains("opus-4-8") {
+        2.0
+    } else if model.contains("opus-4-7") || model.contains("opus-4-6") {
+        6.0
+    } else {
+        1.0
+    }
+}
+
+/// Single source of truth for per-turn cost (USD), used by both the live status
+/// bar (`reduce_session`) and the Usage page (`commands::usage`).
+///
+/// Splits cache-write tokens into 5-minute and 1-hour tiers, applies the
+/// fast-mode multiplier to the token line when the turn ran in fast mode, and
+/// adds the flat web-search fee (which is not a token cost and so is unaffected
+/// by the fast multiplier).
+pub fn cost_for_entry(entry: &UsageEntry) -> f64 {
+    let p = pricing_for_model(&entry.model);
+    let cw_1h = entry.cache_write_1h_tokens.min(entry.cache_write_tokens);
+    let cw_5m = entry.cache_write_tokens - cw_1h;
+    let token_cost = entry.input_tokens as f64 * p.input
+        + entry.output_tokens as f64 * p.output
+        + entry.cache_read_tokens as f64 * p.cache_read
+        + cw_5m as f64 * p.cache_write
+        + cw_1h as f64 * p.cache_write_1h;
+    let fast = if entry.speed.as_deref() == Some("fast") {
+        fast_multiplier_for_model(&entry.model)
+    } else {
+        1.0
+    };
+    (token_cost * fast) / 1_000_000.0
+        + entry.web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
 }
 
 pub fn context_window_for_model(model: &str) -> u64 {
@@ -76,7 +137,25 @@ pub struct UsageEntry {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Total cache-write (creation) tokens for this turn: `max(legacy flat
+    /// `cache_creation_input_tokens`, ephemeral_5m + ephemeral_1h)`. The 1-hour
+    /// subset is broken out separately in `cache_write_1h_tokens` for pricing;
+    /// this total still drives cache-hit % and token displays.
     pub cache_write_tokens: u64,
+    /// The 1-hour-TTL portion of `cache_write_tokens` (from
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`). Billed at 2× input
+    /// vs the 5-minute tier's 1.25×. The 5-minute portion is the remainder.
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
+    /// Anthropic web-search server-tool requests this turn
+    /// (`usage.server_tool_use.web_search_requests`). Billed flat at $0.01 each.
+    #[serde(default)]
+    pub web_search_requests: u64,
+    /// `usage.speed`: `"standard"` or `"fast"`. `Some("fast")` applies the
+    /// fast-mode cost multiplier (see `fast_multiplier_for_model`). `None` on
+    /// rows that predate the field.
+    #[serde(default)]
+    pub speed: Option<String>,
     /// Names of tools this turn invoked (from `tool_use` content blocks).
     /// Empty for pure-text turns. Duplicates preserved when the model called
     /// the same tool multiple times in one turn.
@@ -186,7 +265,29 @@ struct UsageData {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    /// Legacy flat total of cache-creation tokens. Still emitted alongside the
+    /// nested `cache_creation` split; we take the max of the two for safety.
     cache_creation_input_tokens: Option<u64>,
+    /// 5-minute / 1-hour cache-write split (Claude Code ≥ the 1h-cache rollout).
+    cache_creation: Option<CacheCreation>,
+    /// Server-tool request counts (web search / web fetch).
+    server_tool_use: Option<ServerToolUse>,
+    /// `"standard"` | `"fast"`. Drives the fast-mode cost multiplier.
+    speed: Option<String>,
+}
+
+/// Nested `usage.cache_creation` object splitting cache writes by TTL tier.
+#[derive(Deserialize, Default)]
+struct CacheCreation {
+    ephemeral_5m_input_tokens: Option<u64>,
+    ephemeral_1h_input_tokens: Option<u64>,
+}
+
+/// Nested `usage.server_tool_use` object. Only `web_search_requests` is billable
+/// ($0.01/req); `web_fetch_requests` is free and intentionally not priced.
+#[derive(Deserialize, Default)]
+struct ServerToolUse {
+    web_search_requests: Option<u64>,
 }
 
 /// Single hook execution in a `hookInfos` array (v2.1.119+ system records).
@@ -602,6 +703,29 @@ pub fn parse_jsonl_entries(path: &Path) -> std::io::Result<ParsedJsonl> {
             .map(|dt| dt.timestamp_millis().max(0) as u64)
             .unwrap_or(0);
 
+        // Cache-write tokens: prefer the larger of the legacy flat total and the
+        // 5m+1h split (guards partial/missing fields across Claude Code
+        // versions). Break out the 1-hour subset for tiered pricing.
+        let cw_flat = usage.cache_creation_input_tokens.unwrap_or(0);
+        let (eph_5m, eph_1h) = usage
+            .cache_creation
+            .as_ref()
+            .map(|c| {
+                (
+                    c.ephemeral_5m_input_tokens.unwrap_or(0),
+                    c.ephemeral_1h_input_tokens.unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        let cache_write_tokens = cw_flat.max(eph_5m + eph_1h);
+        let cache_write_1h_tokens = eph_1h.min(cache_write_tokens);
+        let web_search_requests = usage
+            .server_tool_use
+            .as_ref()
+            .map(|s| s.web_search_requests.unwrap_or(0))
+            .unwrap_or(0);
+        let speed = usage.speed.clone();
+
         // First row for this message: push placeholder entry with the content
         // we've seen so far. Activity is classified at the end of the file
         // against the merged content from all rows sharing this `message.id`.
@@ -620,7 +744,10 @@ pub fn parse_jsonl_entries(path: &Path) -> std::io::Result<ParsedJsonl> {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
             cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-            cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            cache_write_tokens,
+            cache_write_1h_tokens,
+            web_search_requests,
+            speed,
             tool_uses: content_parsed.tool_uses,
             text_chars: content_parsed.text_chars,
             activity: Activity::General,
@@ -799,12 +926,10 @@ pub fn reduce_session(
                 .unwrap_or_default()
         });
 
-    let pricing = pricing_for_model(&primary_model);
-    let estimated_cost = (input_tokens as f64 * pricing.input
-        + output_tokens as f64 * pricing.output
-        + cache_read as f64 * pricing.cache_read
-        + cache_write as f64 * pricing.cache_write)
-        / 1_000_000.0;
+    // Sum per-entry cost so mixed-model sessions, the 1-hour cache premium, the
+    // fast-mode multiplier, and web-search fees are all priced correctly — the
+    // single source of truth is `cost_for_entry`.
+    let estimated_cost: f64 = entries.iter().map(cost_for_entry).sum();
 
     let context_model = if launched_model.is_empty() {
         &primary_model
@@ -970,7 +1095,7 @@ mod tests {
 
     #[test]
     fn parse_skips_non_assistant_entries() {
-        let lines = vec![
+        let lines = [
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string(),
             r#"{"type":"permission-mode"}"#.to_string(),
             r#"{"type":"file-history-snapshot"}"#.to_string(),
@@ -1052,6 +1177,9 @@ mod tests {
             output_tokens: 1,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1079,6 +1207,9 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1101,6 +1232,9 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: cr,
             cache_write_tokens: cw,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1126,6 +1260,9 @@ mod tests {
             output_tokens: 1,
             cache_read_tokens: cr,
             cache_write_tokens: cw,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1154,6 +1291,9 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: cr,
             cache_write_tokens: cw,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1179,6 +1319,9 @@ mod tests {
             output_tokens: 1_000_000,  // $25
             cache_read_tokens: 1_000_000, // $0.50
             cache_write_tokens: 1_000_000, // $6.25
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
             tool_uses: Vec::new(),
             text_chars: 0,
             activity: Activity::General,
@@ -1581,5 +1724,123 @@ mod tests {
         assert_eq!(parsed.hooks.len(), 2, "both formats parsed");
         assert_eq!(parsed.hooks[0].hook_event, "PostToolUse");
         assert_eq!(parsed.hooks[1].hook_event, "Stop");
+    }
+
+    // ---------- tiered cache / fast mode / web search pricing ----------
+
+    #[allow(clippy::too_many_arguments)]
+    fn entry_for_cost(
+        model: &str,
+        input: u64,
+        output: u64,
+        cr: u64,
+        cw_total: u64,
+        cw_1h: u64,
+        web: u64,
+        speed: Option<&str>,
+    ) -> UsageEntry {
+        UsageEntry {
+            session_id: "s".into(),
+            timestamp_ms: 0,
+            model: model.into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cr,
+            cache_write_tokens: cw_total,
+            cache_write_1h_tokens: cw_1h,
+            web_search_requests: web,
+            speed: speed.map(|s| s.to_string()),
+            tool_uses: Vec::new(),
+            text_chars: 0,
+            activity: Activity::General,
+            entrypoint: None,
+        }
+    }
+
+    #[test]
+    fn cost_splits_5m_and_1h_cache_writes() {
+        // Opus: 5m write $6.25/M, 1h write $10/M.
+        let all_1h = entry_for_cost("claude-opus-4-8", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&all_1h) - 10.0).abs() < 1e-6);
+        let all_5m = entry_for_cost("claude-opus-4-8", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&all_5m) - 6.25).abs() < 1e-6);
+        // 400k 1h + 600k 5m = 0.4*10 + 0.6*6.25 = $7.75.
+        let mixed = entry_for_cost("claude-opus-4-8", 0, 0, 0, 1_000_000, 400_000, 0, None);
+        assert!((cost_for_entry(&mixed) - 7.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cost_adds_flat_web_search_fee() {
+        // 3 web searches → $0.03, independent of tokens.
+        let e = entry_for_cost("claude-sonnet-4-6", 0, 0, 0, 0, 0, 3, None);
+        assert!((cost_for_entry(&e) - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fast_mode_multiplier_scales_token_cost_not_web_fee() {
+        // Opus 4.8 fast = 2x: 1M input $5 → $10.
+        let std = entry_for_cost("claude-opus-4-8", 1_000_000, 0, 0, 0, 0, 0, Some("standard"));
+        assert!((cost_for_entry(&std) - 5.0).abs() < 1e-6);
+        let fast = entry_for_cost("claude-opus-4-8", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&fast) - 10.0).abs() < 1e-6);
+        // Opus 4.6 fast = 6x → $30.
+        let fast46 = entry_for_cost("claude-opus-4-6", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&fast46) - 30.0).abs() < 1e-6);
+        // Web fee is flat even under fast: $10 token + $0.01 search.
+        let fast_web = entry_for_cost("claude-opus-4-8", 1_000_000, 0, 0, 0, 0, 1, Some("fast"));
+        assert!((cost_for_entry(&fast_web) - 10.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fast_multiplier_only_for_known_opus() {
+        assert_eq!(fast_multiplier_for_model("claude-opus-4-8"), 2.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-4-7"), 6.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-4-6"), 6.0);
+        assert_eq!(fast_multiplier_for_model("claude-sonnet-4-6"), 1.0);
+        // Unknown future model → no premium (never overcount on a guess).
+        assert_eq!(fast_multiplier_for_model("claude-opus-5-0"), 1.0);
+    }
+
+    #[test]
+    fn parse_extracts_cache_split_speed_and_web_search() {
+        let line = r#"{"type":"assistant","timestamp":"2026-05-29T10:00:00.000Z","message":{"id":"msg_1","model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":673,"cache_read_input_tokens":0,"cache_creation_input_tokens":40702,"cache_creation":{"ephemeral_5m_input_tokens":700,"ephemeral_1h_input_tokens":40002},"server_tool_use":{"web_search_requests":2,"web_fetch_requests":5},"speed":"fast"}}}"#;
+        let (_tmp, path) = write_jsonl(&[line]);
+        let entries = parse_jsonl_entries(&path).unwrap().entries;
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.cache_write_tokens, 40702, "flat total preserved (== 5m+1h)");
+        assert_eq!(e.cache_write_1h_tokens, 40002);
+        assert_eq!(e.web_search_requests, 2);
+        assert_eq!(e.speed.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn parse_cache_write_takes_max_of_flat_and_split() {
+        // Nested split sums higher than the flat field → prefer the split.
+        let line = r#"{"type":"assistant","timestamp":"2026-05-29T10:00:00.000Z","message":{"id":"msg_2","model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":900}}}}"#;
+        let (_tmp, path) = write_jsonl(&[line]);
+        let e = &parse_jsonl_entries(&path).unwrap().entries[0];
+        assert_eq!(e.cache_write_tokens, 1400, "max(100, 500+900)");
+        assert_eq!(e.cache_write_1h_tokens, 900);
+    }
+
+    #[test]
+    fn parse_missing_nested_cache_falls_back_to_flat() {
+        // Older rows: only the flat field → 1h = 0 (all treated as 5m), no speed/web.
+        let line = assistant_line("msg_3", "claude-opus-4-8", "2026-05-29T10:00:00.000Z", 5, 10, 0, 30000);
+        let (_tmp, path) = write_jsonl(&[&line]);
+        let e = &parse_jsonl_entries(&path).unwrap().entries[0];
+        assert_eq!(e.cache_write_tokens, 30000);
+        assert_eq!(e.cache_write_1h_tokens, 0);
+        assert_eq!(e.web_search_requests, 0);
+        assert_eq!(e.speed, None);
+    }
+
+    #[test]
+    fn reduce_session_prices_1h_cache_premium() {
+        // 1M of 1h cache writes on opus = $10, not the old single-rate $6.25.
+        let e = entry_for_cost("claude-opus-4-8", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        let u = reduce_session(&[e], "", "sid").unwrap();
+        assert!((u.estimated_cost_usd - 10.0).abs() < 1e-6);
     }
 }

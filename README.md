@@ -14,7 +14,7 @@ read-only, no network, no subprocess, no writes.
 
 ```toml
 [dependencies]
-claude-session-parser = "0.1"
+claude-session-parser = "0.2"
 ```
 
 <br>
@@ -54,6 +54,7 @@ for evt in events {
 | `parse_jsonl_entries(path)` | `Vec<UsageEntry>` — one per assistant message (tokens, model, tool uses, cache stats, activity class, hooks) |
 | `parse_chat_events(path)` | `Vec<ChatEvent>` — flat, timestamp-ordered user / assistant / thinking / tool-use / tool-result events |
 | `reduce_session(entries, model, session_id)` | `Option<SessionUsage>` — totals, cost, context-window %, cache-hit rate |
+| `cost_for_entry(&UsageEntry)` | `f64` — canonical per-turn cost (USD); tiered cache writes, fast-mode multiplier, web-search fee |
 | `classify(...)` | `Activity` — deterministic activity tag (13 categories: Coding, Debugging, Refactor, Testing, Exploration, …). No LLM, no regex. |
 | `encode_project_path(path)` | `String` — replicates Claude Code's `~/.claude/projects/` directory-name encoding |
 | `find_current_session_jsonl(project_root)` | Active session JSONL for a project from Claude Code's `sessions/` registry |
@@ -82,6 +83,13 @@ No subprocess. No filesystem writes. ~2600 lines of source.
   alone silently drops every block after the first.
 - **`<synthetic>` model rows** are skipped — internal routing entries, not
   real LLM turns.
+- **Tiered cache / fast mode / web search.** Cache writes split into 5-minute
+  (1.25× input) and 1-hour (2× input) tiers via
+  `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`; fast mode
+  (`usage.speed == "fast"`) multiplies the token line (Opus 4.6/4.7 = 6×,
+  4.8 = 2×); `usage.server_tool_use.web_search_requests` bills $0.01 flat each.
+  `cost_for_entry` accounts for all three — pricing only input/output/cache_read
+  undercounts 1h-cache-heavy turns by ~38%.
 - **Hook executions** are parsed from both the legacy `attachment` format and
   the v2.1.119+ `system.subtype = "*_hook_summary"` format.
 

@@ -26,9 +26,19 @@ pub struct ModelPricing {
     pub cache_write_1h: f64,
 }
 
-/// Hardcoded as of 2026-05. Requires a code change + release when Anthropic updates pricing.
+/// Hardcoded as of 2026-06. Requires a code change + release when Anthropic updates pricing.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
-    if model.contains("opus") {
+    if model.contains("fable") {
+        // Fable 5: $10/$50 per MTok (2026-06). Cache rates derive from input
+        // at the standard multipliers (0.1× read, 1.25× 5m write, 2× 1h write).
+        ModelPricing {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 1.0,
+            cache_write: 12.5,
+            cache_write_1h: 20.0,
+        }
+    } else if model.contains("opus") {
         ModelPricing {
             input: 5.0,
             output: 25.0,
@@ -69,6 +79,7 @@ pub const WEB_SEARCH_COST_PER_REQUEST: f64 = 0.01;
 /// per-token line (input, output, and the cache rates that derive from input).
 /// Unknown / unsupported models return 1.0 (no premium) so we never overcount
 /// on a guess — newer Opus releases default here until their multiplier is added.
+/// Fable 5 has no fast-mode variant (fast is Opus 4.6-4.8 only) → 1.0.
 pub fn fast_multiplier_for_model(model: &str) -> f64 {
     if model.contains("opus-4-8") {
         2.0
@@ -105,7 +116,8 @@ pub fn cost_for_entry(entry: &UsageEntry) -> f64 {
 }
 
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("[1m]") {
+    // Fable 5 is natively 1M — there is no `[1m]` suffix variant for it.
+    if model.contains("[1m]") || model.contains("fable") {
         1_000_000
     } else {
         200_000
@@ -1755,6 +1767,37 @@ mod tests {
             activity: Activity::General,
             entrypoint: None,
         }
+    }
+
+    #[test]
+    fn fable_pricing_all_token_classes() {
+        // Fable 5: $10 in / $50 out / $1 read / $12.50 5m-write / $20 1h-write per MTok.
+        let input = entry_for_cost("claude-fable-5", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&input) - 10.0).abs() < 1e-6);
+        let output = entry_for_cost("claude-fable-5", 0, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&output) - 50.0).abs() < 1e-6);
+        let read = entry_for_cost("claude-fable-5", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read) - 1.0).abs() < 1e-6);
+        let w5m = entry_for_cost("claude-fable-5", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&w5m) - 12.5).abs() < 1e-6);
+        let w1h = entry_for_cost("claude-fable-5", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fable_has_no_fast_premium() {
+        // Fast mode is Opus-only; an (unexpected) fast-tagged Fable turn must
+        // not be multiplied — never overcount on a guess.
+        let fast = entry_for_cost("claude-fable-5", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&fast) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fable_context_window_is_natively_1m() {
+        // No `[1m]` suffix variant exists for Fable — 1M is the default.
+        assert_eq!(context_window_for_model("claude-fable-5"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-opus-4-8"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-8[1m]"), 1_000_000);
     }
 
     #[test]

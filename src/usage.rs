@@ -26,15 +26,58 @@ pub struct ModelPricing {
     pub cache_write_1h: f64,
 }
 
-/// Hardcoded as of 2026-06. Requires a code change + release when Anthropic updates pricing.
+/// `(major, minor)` of the version that follows `family` in a
+/// `claude-<family>-<major>[-<minor>][-<yyyymmdd>]` id, or `None` when no
+/// parseable version follows it (aliases like `"fable"`, legacy
+/// `claude-3-5-sonnet-…` forms, `<synthetic>`).
+///
+/// An 8-digit segment is a date snapshot, not a minor version, so
+/// `claude-sonnet-5-20260701` is `(5, 0)` while `claude-haiku-4-5-20251001`
+/// is `(4, 5)`. Callers compare with `>=` so an unrecognised future version
+/// prices as the newest tier we know about rather than the oldest.
+fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
+    fn is_date(p: &str) -> bool {
+        p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit())
+    }
+    let rest = model.split_once(family)?.1.strip_prefix('-')?;
+    let mut parts = rest.split('-');
+    let head = parts.next()?;
+    // Legacy ids put the version *before* the family (`claude-3-5-sonnet-…`),
+    // so what follows is a date snapshot, not a version. Reject it rather than
+    // reading 20241022 as major version 20241022.
+    if is_date(head) {
+        return None;
+    }
+    let major: u32 = head.parse().ok()?;
+    let minor = match parts.next() {
+        Some(p) if is_date(p) => 0,
+        Some(p) => p.parse().unwrap_or(0),
+        None => 0,
+    };
+    Some((major, minor))
+}
+
+/// Hardcoded as of 2026-09. Requires a code change + release when Anthropic updates pricing.
+///
+/// Two families price by version, so the id must carry one to get the newer
+/// rate — an alias (`"fable"`, `"sonnet"`) prices as the older tier:
+/// - **Fable 5.1+** reads cache at 0.025× input ($0.25/MTok) instead of the
+///   standard 0.1× ($1/MTok) that Fable 5 pays. Everything else is identical.
+/// - **Sonnet 5+** is $2/$10; Sonnet 4.6 and earlier stay at $3/$15. The $2/$10
+///   launch price became Sonnet 5's standard price on 2026-09-01 — the
+///   scheduled increase to $3/$15 was cancelled.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     if model.contains("fable") {
-        // Fable 5: $10/$50 per MTok (2026-06). Cache rates derive from input
-        // at the standard multipliers (0.1× read, 1.25× 5m write, 2× 1h write).
+        // Fable 5 / 5.1: $10/$50 per MTok. Writes derive from input at the
+        // standard multipliers (1.25× 5m, 2× 1h); only the read rate moved.
+        let cache_read = match family_version(model, "fable") {
+            Some(v) if v >= (5, 1) => 0.25,
+            _ => 1.0,
+        };
         ModelPricing {
             input: 10.0,
             output: 50.0,
-            cache_read: 1.0,
+            cache_read,
             cache_write: 12.5,
             cache_write_1h: 20.0,
         }
@@ -54,8 +97,16 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             cache_write: 1.25,
             cache_write_1h: 2.0,
         }
+    } else if matches!(family_version(model, "sonnet"), Some(v) if v >= (5, 0)) {
+        ModelPricing {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.2,
+            cache_write: 2.5,
+            cache_write_1h: 4.0,
+        }
     } else {
-        // Sonnet or unknown
+        // Sonnet 4.6 and earlier, or unknown
         ModelPricing {
             input: 3.0,
             output: 15.0,
@@ -71,17 +122,17 @@ pub const WEB_SEARCH_COST_PER_REQUEST: f64 = 0.01;
 
 /// Fast-mode (research preview) cost multiplier, applied to the entire token
 /// cost line when `usage.speed == "fast"`. Fast mode is Opus-only and its
-/// premium varies by version (confirmed Anthropic pricing, 2026-05):
+/// premium varies by version (confirmed Anthropic pricing, 2026-09):
 /// - Opus 4.6 / 4.7 fast: 6× ($30/$150 vs $5/$25)
-/// - Opus 4.8 fast:       2× ($10/$50 vs $5/$25)
+/// - Opus 4.8 / 5 fast:   2× ($10/$50 vs $5/$25)
 ///
 /// Caching multipliers stack on top of fast pricing, i.e. fast scales the whole
 /// per-token line (input, output, and the cache rates that derive from input).
 /// Unknown / unsupported models return 1.0 (no premium) so we never overcount
 /// on a guess — newer Opus releases default here until their multiplier is added.
-/// Fable 5 has no fast-mode variant (fast is Opus 4.6-4.8 only) → 1.0.
+/// Fable has no fast-mode variant (fast is Opus-only) → 1.0.
 pub fn fast_multiplier_for_model(model: &str) -> f64 {
-    if model.contains("opus-4-8") {
+    if model.contains("opus-4-8") || model.contains("opus-5") {
         2.0
     } else if model.contains("opus-4-7") || model.contains("opus-4-6") {
         6.0
@@ -1839,9 +1890,85 @@ mod tests {
         assert_eq!(fast_multiplier_for_model("claude-opus-4-8"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-4-7"), 6.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-4-6"), 6.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-5"), 2.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-5[1m]"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-sonnet-4-6"), 1.0);
+        assert_eq!(fast_multiplier_for_model("claude-fable-5-1"), 1.0);
         // Unknown future model → no premium (never overcount on a guess).
-        assert_eq!(fast_multiplier_for_model("claude-opus-5-0"), 1.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-6"), 1.0);
+    }
+
+    #[test]
+    fn fable_5_1_reads_cache_at_a_quarter_of_fable_5() {
+        // Fable 5.1: reads at 0.025× input ($0.25/MTok) instead of Fable 5's
+        // 0.1× ($1/MTok). Every other rate is identical.
+        let read51 = entry_for_cost("claude-fable-5-1", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read51) - 0.25).abs() < 1e-6);
+        let read5 = entry_for_cost("claude-fable-5", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read5) - 1.0).abs() < 1e-6);
+
+        let input = entry_for_cost("claude-fable-5-1", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&input) - 10.0).abs() < 1e-6);
+        let output = entry_for_cost("claude-fable-5-1", 0, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&output) - 50.0).abs() < 1e-6);
+        let w5m = entry_for_cost("claude-fable-5-1", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&w5m) - 12.5).abs() < 1e-6);
+        let w1h = entry_for_cost("claude-fable-5-1", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sonnet_5_is_cheaper_than_sonnet_4_6() {
+        // Sonnet 5: $2/$10 (standard price since 2026-09-01). Sonnet 4.6 and
+        // earlier stay at $3/$15.
+        let in5 = entry_for_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in5) - 2.0).abs() < 1e-6);
+        let out5 = entry_for_cost("claude-sonnet-5", 0, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&out5) - 10.0).abs() < 1e-6);
+        let read5 = entry_for_cost("claude-sonnet-5", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read5) - 0.2).abs() < 1e-6);
+        let w5m = entry_for_cost("claude-sonnet-5", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&w5m) - 2.5).abs() < 1e-6);
+        let w1h = entry_for_cost("claude-sonnet-5", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 4.0).abs() < 1e-6);
+
+        let in46 = entry_for_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in46) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unknown_models_keep_the_conservative_sonnet_rate() {
+        // An id with no parseable family version must not pick up the newer,
+        // cheaper tier — undercounting a real spend is worse than the default.
+        for id in ["", "<unknown>", "sonnet", "claude-3-5-sonnet-20241022"] {
+            let p = pricing_for_model(id);
+            assert_eq!(p.input, 3.0, "{id} should price at the Sonnet default");
+        }
+        // …except "fable", which is still recognised as the Fable family and
+        // prices at the older (more expensive) cache-read rate.
+        assert_eq!(pricing_for_model("fable").cache_read, 1.0);
+    }
+
+    #[test]
+    fn family_version_reads_minor_and_ignores_date_snapshots() {
+        assert_eq!(family_version("claude-fable-5-1", "fable"), Some((5, 1)));
+        assert_eq!(family_version("claude-fable-5", "fable"), Some((5, 0)));
+        assert_eq!(family_version("claude-sonnet-5", "sonnet"), Some((5, 0)));
+        assert_eq!(family_version("claude-sonnet-4-6", "sonnet"), Some((4, 6)));
+        assert_eq!(
+            family_version("claude-haiku-4-5-20251001", "haiku"),
+            Some((4, 5))
+        );
+        // 8-digit segment is a date, not a minor version.
+        assert_eq!(
+            family_version("claude-sonnet-5-20260701", "sonnet"),
+            Some((5, 0))
+        );
+        assert_eq!(family_version("fable", "fable"), None);
+        assert_eq!(family_version("claude-opus-4-8", "sonnet"), None);
+        // Legacy ids carry the version before the family name, so the segment
+        // after it is a date — not major version 20241022.
+        assert_eq!(family_version("claude-3-5-sonnet-20241022", "sonnet"), None);
     }
 
     #[test]

@@ -87,7 +87,7 @@ No subprocess. No filesystem writes. ~2600 lines of source.
   (1.25× input) and 1-hour (2× input) tiers via
   `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`; fast mode
   (`usage.speed == "fast"`) multiplies the token line (Opus 4.6/4.7 = 6×,
-  4.8 = 2×); `usage.server_tool_use.web_search_requests` bills $0.01 flat each.
+  4.8/5/5.5 = 2×); `usage.server_tool_use.web_search_requests` bills $0.01 flat each.
   `cost_for_entry` accounts for all three — pricing only input/output/cache_read
   undercounts 1h-cache-heavy turns by ~38%.
 - **Hook executions** are parsed from both the legacy `attachment` format and

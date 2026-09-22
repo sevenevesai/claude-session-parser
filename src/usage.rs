@@ -35,10 +35,15 @@ pub struct ModelPricing {
 /// `claude-sonnet-5-20260701` is `(5, 0)` while `claude-haiku-4-5-20251001`
 /// is `(4, 5)`. Callers compare with `>=` so an unrecognised future version
 /// prices as the newest tier we know about rather than the oldest.
+///
+/// A trailing context-window tag (`claude-opus-5-5[1m]`) is dropped first:
+/// left in, it glues onto the last version segment and reads as `(5, 0)` —
+/// or fails the parse outright for `claude-sonnet-5[1m]`.
 fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
     fn is_date(p: &str) -> bool {
         p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit())
     }
+    let model = model.split('[').next().unwrap_or(model);
     let rest = model.split_once(family)?.1.strip_prefix('-')?;
     let mut parts = rest.split('-');
     let head = parts.next()?;
@@ -59,10 +64,12 @@ fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
 
 /// Hardcoded as of 2026-09. Requires a code change + release when Anthropic updates pricing.
 ///
-/// Two families price by version, so the id must carry one to get the newer
-/// rate — an alias (`"fable"`, `"sonnet"`) prices as the older tier:
+/// Three families price by version, so the id must carry one to get the newer
+/// rate — an alias (`"fable"`, `"opus"`, `"sonnet"`) prices as the older tier:
 /// - **Fable 5.1+** reads cache at 0.025× input ($0.25/MTok) instead of the
 ///   standard 0.1× ($1/MTok) that Fable 5 pays. Everything else is identical.
+/// - **Opus 5.5+** is $4/$20 and reads cache at 0.05× input ($0.20/MTok);
+///   Opus 5 and earlier stay at $5/$25 with the standard 0.1× read.
 /// - **Sonnet 5+** is $2/$10; Sonnet 4.6 and earlier stay at $3/$15. The $2/$10
 ///   launch price became Sonnet 5's standard price on 2026-09-01 — the
 ///   scheduled increase to $3/$15 was cancelled.
@@ -80,6 +87,16 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             cache_read,
             cache_write: 12.5,
             cache_write_1h: 20.0,
+        }
+    } else if matches!(family_version(model, "opus"), Some(v) if v >= (5, 5)) {
+        // Opus 5.5: $4/$20, writes at the standard multipliers, reads at
+        // 0.05× input rather than 0.1×.
+        ModelPricing {
+            input: 4.0,
+            output: 20.0,
+            cache_read: 0.2,
+            cache_write: 5.0,
+            cache_write_1h: 8.0,
         }
     } else if model.contains("opus") {
         ModelPricing {
@@ -125,6 +142,7 @@ pub const WEB_SEARCH_COST_PER_REQUEST: f64 = 0.01;
 /// premium varies by version (confirmed Anthropic pricing, 2026-09):
 /// - Opus 4.6 / 4.7 fast: 6× ($30/$150 vs $5/$25)
 /// - Opus 4.8 / 5 fast:   2× ($10/$50 vs $5/$25)
+/// - Opus 5.5 fast:       2× ($8/$40 vs $4/$20)
 ///
 /// Caching multipliers stack on top of fast pricing, i.e. fast scales the whole
 /// per-token line (input, output, and the cache rates that derive from input).
@@ -1892,6 +1910,8 @@ mod tests {
         assert_eq!(fast_multiplier_for_model("claude-opus-4-6"), 6.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-5"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-5[1m]"), 2.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-5-5"), 2.0);
+        assert_eq!(fast_multiplier_for_model("claude-opus-5-5[1m]"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-sonnet-4-6"), 1.0);
         assert_eq!(fast_multiplier_for_model("claude-fable-5-1"), 1.0);
         // Unknown future model → no premium (never overcount on a guess).
@@ -1918,6 +1938,34 @@ mod tests {
     }
 
     #[test]
+    fn opus_5_5_is_cheaper_than_opus_5() {
+        // Opus 5.5: $4/$20, 5m write $5, 1h write $8, cache read $0.20
+        // (0.05× input). Opus 5 stays at $5/$25 with the 0.1× read.
+        let in55 = entry_for_cost("claude-opus-5-5", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in55) - 4.0).abs() < 1e-6);
+        let out55 = entry_for_cost("claude-opus-5-5", 0, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&out55) - 20.0).abs() < 1e-6);
+        let read55 = entry_for_cost("claude-opus-5-5", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read55) - 0.2).abs() < 1e-6);
+        let w5m = entry_for_cost("claude-opus-5-5", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&w5m) - 5.0).abs() < 1e-6);
+        let w1h = entry_for_cost("claude-opus-5-5", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 8.0).abs() < 1e-6);
+
+        // The 1M-context spelling and fast mode (2×) price the same model.
+        let in55_1m = entry_for_cost("claude-opus-5-5[1m]", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in55_1m) - 4.0).abs() < 1e-6);
+        let fast = entry_for_cost("claude-opus-5-5", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&fast) - 8.0).abs() < 1e-6);
+
+        // Opus 5 and the bare alias keep the older, dearer tier.
+        let in5 = entry_for_cost("claude-opus-5", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in5) - 5.0).abs() < 1e-6);
+        assert_eq!(pricing_for_model("opus").input, 5.0);
+        assert_eq!(pricing_for_model("opus").cache_read, 0.5);
+    }
+
+    #[test]
     fn sonnet_5_is_cheaper_than_sonnet_4_6() {
         // Sonnet 5: $2/$10 (standard price since 2026-09-01). Sonnet 4.6 and
         // earlier stay at $3/$15.
@@ -1934,6 +1982,10 @@ mod tests {
 
         let in46 = entry_for_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0, 0, 0, None);
         assert!((cost_for_entry(&in46) - 3.0).abs() < 1e-6);
+
+        // The 1M-context spelling is the same model, not an unknown one.
+        let in5_1m = entry_for_cost("claude-sonnet-5[1m]", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&in5_1m) - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1955,6 +2007,8 @@ mod tests {
         assert_eq!(family_version("claude-fable-5", "fable"), Some((5, 0)));
         assert_eq!(family_version("claude-sonnet-5", "sonnet"), Some((5, 0)));
         assert_eq!(family_version("claude-sonnet-4-6", "sonnet"), Some((4, 6)));
+        assert_eq!(family_version("claude-opus-5-5", "opus"), Some((5, 5)));
+        assert_eq!(family_version("claude-opus-5-5[1m]", "opus"), Some((5, 5)));
         assert_eq!(
             family_version("claude-haiku-4-5-20251001", "haiku"),
             Some((4, 5))

@@ -36,6 +36,6 @@ pub use activity::{classify, normalize_user_text, Activity};
 pub use chat::{parse_chat_events, ChatEvent};
 pub use usage::{
     context_window_for_model, encode_project_path, find_current_session_jsonl,
-    parse_jsonl_entries, pricing_for_model, reduce_session, HookExecution, ModelPricing,
-    ParsedJsonl, SessionUsage, UsageEntry,
+    parse_jsonl_entries, pricing_for_entry, pricing_for_model, reduce_session, HookExecution,
+    ModelPricing, ParsedJsonl, SessionUsage, UsageEntry,
 };

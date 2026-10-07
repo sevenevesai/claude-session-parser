@@ -62,9 +62,38 @@ fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Hardcoded as of 2026-09. Requires a code change + release when Anthropic updates pricing.
+/// Haiku 5.5 bills by prompt size: prompts over this many tokens pay the
+/// long-context tier. The docs don't say which token classes count; we use
+/// input + cache reads + cache writes (see `pricing_for_entry`).
+const HAIKU_LONG_PROMPT_TOKENS: u64 = 100_000;
+
+fn is_haiku_5_5(model: &str) -> bool {
+    matches!(family_version(model, "haiku"), Some(v) if v >= (5, 5))
+}
+
+fn haiku_5_5_pricing(long_prompt: bool) -> ModelPricing {
+    if long_prompt {
+        ModelPricing {
+            input: 0.5,
+            output: 2.5,
+            cache_read: 0.05,
+            cache_write: 0.625,
+            cache_write_1h: 1.0,
+        }
+    } else {
+        ModelPricing {
+            input: 0.1,
+            output: 0.5,
+            cache_read: 0.01,
+            cache_write: 0.125,
+            cache_write_1h: 0.2,
+        }
+    }
+}
+
+/// Hardcoded as of 2026-10. Requires a code change + release when Anthropic updates pricing.
 ///
-/// Three families price by version, so the id must carry one to get the newer
+/// Four families price by version, so the id must carry one to get the newer
 /// rate — an alias (`"fable"`, `"opus"`, `"sonnet"`) prices as the older tier:
 /// - **Fable 5.1+** reads cache at 0.025× input ($0.25/MTok) instead of the
 ///   standard 0.1× ($1/MTok) that Fable 5 pays. Everything else is identical.
@@ -73,6 +102,9 @@ fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
 /// - **Sonnet 5+** is $2/$10; Sonnet 4.6 and earlier stay at $3/$15. The $2/$10
 ///   launch price became Sonnet 5's standard price on 2026-09-01 — the
 ///   scheduled increase to $3/$15 was cancelled.
+/// - **Haiku 5.5+** is $0.10/$0.50 for prompts up to 100k tokens and 5× that
+///   above it; this returns the up-to-100k tier, and `pricing_for_entry`
+///   applies the long-prompt tier. Haiku 4.5 and the `"haiku"` alias stay at $1/$5.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     if model.contains("fable") {
         // Fable 5 / 5.1: $10/$50 per MTok. Writes derive from input at the
@@ -106,6 +138,8 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             cache_write: 6.25,
             cache_write_1h: 10.0,
         }
+    } else if is_haiku_5_5(model) {
+        haiku_5_5_pricing(false)
     } else if model.contains("haiku") {
         ModelPricing {
             input: 1.0,
@@ -131,6 +165,19 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             cache_write: 3.75,
             cache_write_1h: 6.0,
         }
+    }
+}
+
+/// Per-turn rates: `pricing_for_model`, except Haiku 5.5+ turns whose prompt
+/// (input + cache reads + cache writes) exceeds 100k tokens, which bill the
+/// long-prompt tier. Unverified: Anthropic's pricing page doesn't say which
+/// token classes count toward the threshold.
+pub fn pricing_for_entry(entry: &UsageEntry) -> ModelPricing {
+    let prompt = entry.input_tokens + entry.cache_read_tokens + entry.cache_write_tokens;
+    if is_haiku_5_5(&entry.model) && prompt > HAIKU_LONG_PROMPT_TOKENS {
+        haiku_5_5_pricing(true)
+    } else {
+        pricing_for_model(&entry.model)
     }
 }
 
@@ -167,7 +214,7 @@ pub fn fast_multiplier_for_model(model: &str) -> f64 {
 /// adds the flat web-search fee (which is not a token cost and so is unaffected
 /// by the fast multiplier).
 pub fn cost_for_entry(entry: &UsageEntry) -> f64 {
-    let p = pricing_for_model(&entry.model);
+    let p = pricing_for_entry(entry);
     let cw_1h = entry.cache_write_1h_tokens.min(entry.cache_write_tokens);
     let cw_5m = entry.cache_write_tokens - cw_1h;
     let token_cost = entry.input_tokens as f64 * p.input
@@ -185,8 +232,8 @@ pub fn cost_for_entry(entry: &UsageEntry) -> f64 {
 }
 
 pub fn context_window_for_model(model: &str) -> u64 {
-    // Fable 5 is natively 1M — there is no `[1m]` suffix variant for it.
-    if model.contains("[1m]") || model.contains("fable") {
+    // Fable 5 and Haiku 5.5 are natively 1M — there is no `[1m]` suffix variant.
+    if model.contains("[1m]") || model.contains("fable") || is_haiku_5_5(model) {
         1_000_000
     } else {
         200_000
@@ -1986,6 +2033,55 @@ mod tests {
         // The 1M-context spelling is the same model, not an unknown one.
         let in5_1m = entry_for_cost("claude-sonnet-5[1m]", 1_000_000, 0, 0, 0, 0, 0, None);
         assert!((cost_for_entry(&in5_1m) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn haiku_5_5_is_a_tenth_of_haiku_4_5() {
+        // Up to 100k: $0.10/$0.50, 5m write $0.125, 1h write $0.20, read $0.01.
+        for id in ["claude-haiku-5-5", "claude-haiku-5-5-20261007"] {
+            let p = pricing_for_model(id);
+            assert_eq!(p.input, 0.1, "{id}");
+            assert_eq!(p.output, 0.5, "{id}");
+            assert_eq!(p.cache_read, 0.01, "{id}");
+            assert_eq!(p.cache_write, 0.125, "{id}");
+            assert_eq!(p.cache_write_1h, 0.2, "{id}");
+        }
+        // Haiku 4.5 and the bare alias keep the older, dearer tier.
+        for id in ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "haiku"] {
+            let p = pricing_for_model(id);
+            assert_eq!(p.input, 1.0, "{id}");
+            assert_eq!(p.output, 5.0, "{id}");
+            assert_eq!(p.cache_read, 0.1, "{id}");
+        }
+    }
+
+    #[test]
+    fn haiku_5_5_long_prompts_bill_the_higher_tier() {
+        let model = "claude-haiku-5-5";
+        // Prompt = input + cache read + cache write; exactly 100k stays on the base tier.
+        let at = entry_for_cost(model, 50_000, 0, 30_000, 20_000, 0, 0, None);
+        let want_at = (50_000.0 * 0.1 + 30_000.0 * 0.01 + 20_000.0 * 0.125) / 1e6;
+        assert!((cost_for_entry(&at) - want_at).abs() < 1e-9);
+        let over = entry_for_cost(model, 50_000, 0, 30_000, 20_001, 0, 0, None);
+        let want_over = (50_000.0 * 0.5 + 30_000.0 * 0.05 + 20_001.0 * 0.625) / 1e6;
+        assert!((cost_for_entry(&over) - want_over).abs() < 1e-9);
+
+        // Long tier: $2.50 output, $1 1h write.
+        let out = entry_for_cost(model, 100_001, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&out) - (100_001.0 * 0.5 + 2_500_000.0) / 1e6).abs() < 1e-9);
+        let w1h = entry_for_cost(model, 0, 0, 0, 200_000, 200_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 0.2).abs() < 1e-9);
+
+        // Other models are flat regardless of prompt size.
+        let h45 = entry_for_cost("claude-haiku-4-5", 200_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&h45) - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn haiku_5_5_context_window_is_natively_1m() {
+        assert_eq!(context_window_for_model("claude-haiku-5-5"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
     }
 
     #[test]

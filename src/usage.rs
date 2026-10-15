@@ -231,9 +231,16 @@ pub fn cost_for_entry(entry: &UsageEntry) -> f64 {
         + entry.web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
 }
 
+/// Fable, Haiku 5.5+, Opus 5+ and Sonnet 5+ run a 1M window natively: JSONL
+/// strips the `[1m]` tag, yet 74 bare `claude-opus-5*`/`claude-sonnet-5` sessions
+/// were observed sending requests over 200K. Opus/Sonnet 4.x stay 200K unless
+/// tagged `[1m]`.
 pub fn context_window_for_model(model: &str) -> u64 {
-    // Fable 5 and Haiku 5.5 are natively 1M — there is no `[1m]` suffix variant.
-    if model.contains("[1m]") || model.contains("fable") || is_haiku_5_5(model) {
+    let native_1m = model.contains("fable")
+        || is_haiku_5_5(model)
+        || matches!(family_version(model, "opus"), Some(v) if v >= (5, 0))
+        || matches!(family_version(model, "sonnet"), Some(v) if v >= (5, 0));
+    if model.contains("[1m]") || native_1m {
         1_000_000
     } else {
         200_000
@@ -1017,7 +1024,8 @@ fn normalize_path(p: &str) -> String {
 /// - Context window % uses the LAST entry's total input (API resends the full
 ///   conversation each turn; the last turn's input is the current usage).
 /// - `launched_model` (from launch options) is used for context window sizing
-///   because JSONL strips the `[1m]` suffix; fall back to mode when empty.
+///   because JSONL strips the `[1m]` suffix; fall back to mode when empty. The
+///   window is never smaller than the session's peak single-entry context.
 pub fn reduce_session(
     entries: &[UsageEntry],
     launched_model: &str,
@@ -1064,7 +1072,21 @@ pub fn reduce_session(
     } else {
         launched_model
     };
-    let context_window = context_window_for_model(context_model);
+    // A session cannot exceed its window, so a peak above the model's window
+    // means the window is larger than the model string implies (e.g. a launch
+    // whose `[1m]` tag was stripped). Widen to the smallest standard tier.
+    let peak_context = entries
+        .iter()
+        .map(|e| e.input_tokens + e.cache_read_tokens + e.cache_write_tokens)
+        .max()
+        .unwrap_or(0);
+    let mut context_window = context_window_for_model(context_model);
+    if peak_context > context_window {
+        context_window = [200_000, 1_000_000]
+            .into_iter()
+            .find(|&w| peak_context <= w)
+            .unwrap_or(peak_context);
+    }
 
     let last = entries.last().unwrap();
     let last_context_used =
@@ -1347,6 +1369,48 @@ mod tests {
         let without = reduce_session(&entries, "", "sid").unwrap();
         assert_eq!(with_1m.context_window_size, 1_000_000);
         assert_eq!(without.context_window_size, 200_000);
+    }
+
+    #[test]
+    fn bare_opus_and_sonnet_5_plus_are_natively_1m() {
+        for m in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5[1m]",
+        ] {
+            assert_eq!(context_window_for_model(m), 1_000_000, "{m}");
+        }
+        for m in ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"] {
+            assert_eq!(context_window_for_model(m), 200_000, "{m}");
+        }
+    }
+
+    #[test]
+    fn reduce_widens_window_to_hold_peak_context() {
+        let mk = |input: u64, cr: u64| UsageEntry {
+            session_id: "s".into(),
+            timestamp_ms: 0,
+            model: "claude-opus-4-8".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: cr,
+            cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            speed: None,
+            tool_uses: Vec::new(),
+            text_chars: 0,
+            activity: Activity::General,
+            entrypoint: None,
+        };
+        // Peak (250K) is mid-session; the last entry (100K) drives the percentage.
+        let entries = vec![mk(10, 250_000), mk(10, 99_990)];
+        let u = reduce_session(&entries, "claude-opus-4-8", "sid").unwrap();
+        assert_eq!(u.context_window_size, 1_000_000);
+        assert_eq!(u.current_context_tokens, 100_000);
+        assert!((u.context_window_used_pct - 10.0).abs() < 0.01);
     }
 
     #[test]

@@ -465,40 +465,61 @@ struct ActiveSession {
 /// needs generous headroom.
 use super::MAX_JSONL_BYTES;
 
-/// Encode a project path the same way Claude Code does.
-///
-/// Windows: `S:\Loom` -> `S--Loom`, `C:\Users\Seven\foo` -> `C--Users-Seven-foo`
-/// macOS/Linux: `/Users/seven/Loom` -> `-Users-seven-Loom`, `/home/alice/proj` -> `-home-alice-proj`
-///
-/// The transform collapses any leading path separator(s) into a single leading
-/// dash, which is how Claude Code writes `~/.claude/projects/` directory names
-/// on Unix. Verified against ccusage's decoder (see GitHub issue
-/// anthropics/claude-code#19972 for the path-encoding discussion).
-pub fn encode_project_path(project_path: &str) -> String {
-    let normalized = project_path.replace('/', "\\");
-    let mut result = String::new();
-    let mut chars = normalized.chars().peekable();
+/// Longest folder name Claude Code writes before truncating and appending a hash.
+const MAX_ENCODED_LEN: usize = 200;
 
-    while let Some(ch) = chars.next() {
-        if ch == ':' {
-            if chars.peek() == Some(&'\\') {
-                chars.next();
-                result.push_str("--");
-            } else {
-                result.push('-');
-            }
-        } else if ch == '\\' {
-            result.push('-');
-        } else {
-            result.push(ch);
+/// Encode a project path the way Claude Code names its `~/.claude/projects/` folders (checked
+/// against Claude Code 2.1.287): every UTF-16 code unit that is not an ASCII letter or digit
+/// becomes `-`, and a name longer than 200 is cut to 200 and suffixed with `-` and a base-36
+/// hash of the path.
+///
+/// Windows: `S:\Loom` -> `S--Loom`, `C:\Users\me\.claude` -> `C--Users-me--claude`
+/// macOS/Linux: `/Users/seven/Loom` -> `-Users-seven-Loom`
+///
+/// Trailing separators are dropped first, since a stored `S:\Loom\` is the folder Claude Code
+/// runs in as `S:\Loom`; a bare root (`S:\`, `/`) keeps its separator.
+pub fn encode_project_path(project_path: &str) -> String {
+    let trimmed = project_path.trim_end_matches(['/', '\\']);
+    let path = if trimmed.is_empty() || trimmed.ends_with(':') {
+        project_path
+    } else {
+        trimmed
+    };
+    let encoded: String = path
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(b) if b.is_ascii_alphanumeric() => b as char,
+            _ => '-',
+        })
+        .collect();
+    if encoded.len() <= MAX_ENCODED_LEN {
+        return encoded;
+    }
+    format!(
+        "{}-{}",
+        &encoded[..MAX_ENCODED_LEN],
+        base36(path_hash(path).unsigned_abs())
+    )
+}
+
+/// Claude Code's 32-bit string hash, `h = (h << 5) - h + unit` over UTF-16 code units.
+fn path_hash(path: &str) -> i32 {
+    path.encode_utf16()
+        .fold(0i32, |h, unit| (h << 5).wrapping_sub(h).wrapping_add(i32::from(unit)))
+}
+
+fn base36(mut n: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
         }
     }
-
-    while result.ends_with('-') {
-        result.pop();
-    }
-
-    result
+    out.reverse();
+    String::from_utf8(out).expect("ASCII digits")
 }
 
 /// Extracted signal from an assistant message's `content` array.
@@ -1183,6 +1204,41 @@ mod tests {
     #[test]
     fn test_encode_project_path_unix_trailing_slash() {
         assert_eq!(encode_project_path("/Users/seven/Loom/"), "-Users-seven-Loom");
+    }
+
+    // Expected values below come from Claude Code 2.1.287's own sanitizer and hash, run in Node.
+    #[test]
+    fn test_encode_project_path_every_non_alphanumeric_becomes_dash() {
+        assert_eq!(
+            encode_project_path("C:\\Users\\Seven\\AppData\\Roaming\\com.lloom.app.test\\fixtures\\pong"),
+            "C--Users-Seven-AppData-Roaming-com-lloom-app-test-fixtures-pong"
+        );
+        assert_eq!(
+            encode_project_path("C:\\Games\\Graal\\VSC\\Era Legacy"),
+            "C--Games-Graal-VSC-Era-Legacy"
+        );
+        assert_eq!(encode_project_path("C:\\Users\\Seven\\.claude"), "C--Users-Seven--claude");
+        assert_eq!(
+            encode_project_path("C:\\Users\\Seven\\\u{dc}n\u{ef}code \u{1F600}"),
+            "C--Users-Seven--n-code---"
+        );
+    }
+
+    #[test]
+    fn test_encode_project_path_bare_roots_keep_their_separator() {
+        assert_eq!(encode_project_path("S:\\"), "S--");
+        assert_eq!(encode_project_path("/"), "-");
+    }
+
+    #[test]
+    fn test_encode_project_path_long_names_get_claudes_hash_suffix() {
+        let path = format!("C:\\Users\\Seven\\{}end", "very-long_folder.name ".repeat(12));
+        assert_eq!(
+            encode_project_path(&path),
+            "C--Users-Seven-very-long-folder-name-very-long-folder-name-very-long-folder-name-\
+             very-long-folder-name-very-long-folder-name-very-long-folder-name-very-long-folder-\
+             name-very-long-folder-name-very-long-wel9nd"
+        );
     }
 
     #[test]

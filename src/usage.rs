@@ -62,9 +62,9 @@ fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Haiku 5.5 bills by prompt size: prompts over this many tokens pay the
-/// long-context tier. The docs don't say which token classes count; we use
-/// input + cache reads + cache writes (see `pricing_for_entry`).
+/// Haiku 5.5 bills by prompt size: a request whose prompt exceeds this many
+/// tokens pays the long-prompt tier on all of it. The prompt counts input,
+/// cache reads and cache writes (Anthropic's pricing page).
 const HAIKU_LONG_PROMPT_TOKENS: u64 = 100_000;
 
 fn is_haiku_5_5(model: &str) -> bool {
@@ -101,7 +101,8 @@ fn haiku_5_5_pricing(long_prompt: bool) -> ModelPricing {
 ///   Opus 5 and earlier stay at $5/$25 with the standard 0.1× read.
 /// - **Sonnet 5+** is $2/$10; Sonnet 4.6 and earlier stay at $3/$15. The $2/$10
 ///   launch price became Sonnet 5's standard price on 2026-09-01 — the
-///   scheduled increase to $3/$15 was cancelled.
+///   scheduled increase to $3/$15 was cancelled. **Sonnet 5.5+** reads cache
+///   at 0.05× input ($0.10/MTok); Sonnet 5 at the standard 0.1×.
 /// - **Haiku 5.5+** is $0.10/$0.50 for prompts up to 100k tokens and 5× that
 ///   above it; this returns the up-to-100k tier, and `pricing_for_entry`
 ///   applies the long-prompt tier. Haiku 4.5 and the `"haiku"` alias stay at $1/$5.
@@ -148,11 +149,12 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             cache_write: 1.25,
             cache_write_1h: 2.0,
         }
-    } else if matches!(family_version(model, "sonnet"), Some(v) if v >= (5, 0)) {
+    } else if let Some(v) = family_version(model, "sonnet").filter(|v| *v >= (5, 0)) {
+        // Sonnet 5.5 reads at 0.05× input like Opus 5.5; Sonnet 5 at 0.1×.
         ModelPricing {
             input: 2.0,
             output: 10.0,
-            cache_read: 0.2,
+            cache_read: if v >= (5, 5) { 0.1 } else { 0.2 },
             cache_write: 2.5,
             cache_write_1h: 4.0,
         }
@@ -170,8 +172,7 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
 
 /// Per-turn rates: `pricing_for_model`, except Haiku 5.5+ turns whose prompt
 /// (input + cache reads + cache writes) exceeds 100k tokens, which bill the
-/// long-prompt tier. Unverified: Anthropic's pricing page doesn't say which
-/// token classes count toward the threshold.
+/// long-prompt tier.
 pub fn pricing_for_entry(entry: &UsageEntry) -> ModelPricing {
     let prompt = entry.input_tokens + entry.cache_read_tokens + entry.cache_write_tokens;
     if is_haiku_5_5(&entry.model) && prompt > HAIKU_LONG_PROMPT_TOKENS {
@@ -2153,6 +2154,18 @@ mod tests {
         // The 1M-context spelling is the same model, not an unknown one.
         let in5_1m = entry_for_cost("claude-sonnet-5[1m]", 1_000_000, 0, 0, 0, 0, 0, None);
         assert!((cost_for_entry(&in5_1m) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sonnet_5_5_reads_cache_at_half_sonnet_5s_rate() {
+        // Sonnet 5.5: $2/$10, writes $2.50/$4, reads $0.10 (0.05× input).
+        for id in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
+            let p = pricing_for_model(id);
+            assert_eq!((p.input, p.output), (2.0, 10.0), "{id}");
+            assert_eq!((p.cache_write, p.cache_write_1h), (2.5, 4.0), "{id}");
+            assert_eq!(p.cache_read, 0.1, "{id}");
+        }
+        assert_eq!(pricing_for_model("claude-sonnet-5").cache_read, 0.2);
     }
 
     #[test]

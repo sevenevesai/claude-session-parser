@@ -91,12 +91,13 @@ fn haiku_5_5_pricing(long_prompt: bool) -> ModelPricing {
     }
 }
 
-/// Hardcoded as of 2026-10. Requires a code change + release when Anthropic updates pricing.
+/// Hardcoded as of 2026-11. Requires a code change + release when Anthropic updates pricing.
 ///
 /// Four families price by version, so the id must carry one to get the newer
 /// rate — an alias (`"fable"`, `"opus"`, `"sonnet"`) prices as the older tier:
-/// - **Fable 5.1+** reads cache at 0.025× input ($0.25/MTok) instead of the
-///   standard 0.1× ($1/MTok) that Fable 5 pays. Everything else is identical.
+/// - **Fable 5.2+** is $8/$40; Fable 5 and 5.1 are $10/$50. **Fable 5.1+**
+///   reads cache at 0.025× input ($0.20 and $0.25/MTok) instead of the
+///   standard 0.1× ($1/MTok) that Fable 5 pays.
 /// - **Opus 5.5+** is $4/$20 and reads cache at 0.05× input ($0.20/MTok);
 ///   Opus 5 and earlier stay at $5/$25 with the standard 0.1× read.
 /// - **Sonnet 5+** is $2/$10; Sonnet 4.6 and earlier stay at $3/$15. The $2/$10
@@ -108,18 +109,29 @@ fn haiku_5_5_pricing(long_prompt: bool) -> ModelPricing {
 ///   applies the long-prompt tier. Haiku 4.5 and the `"haiku"` alias stay at $1/$5.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     if model.contains("fable") {
-        // Fable 5 / 5.1: $10/$50 per MTok. Writes derive from input at the
-        // standard multipliers (1.25× 5m, 2× 1h); only the read rate moved.
-        let cache_read = match family_version(model, "fable") {
-            Some(v) if v >= (5, 1) => 0.25,
-            _ => 1.0,
-        };
-        ModelPricing {
-            input: 10.0,
-            output: 50.0,
-            cache_read,
-            cache_write: 12.5,
-            cache_write_1h: 20.0,
+        // Writes sit at the standard multipliers (1.25× 5m, 2× 1h input).
+        match family_version(model, "fable") {
+            Some(v) if v >= (5, 2) => ModelPricing {
+                input: 8.0,
+                output: 40.0,
+                cache_read: 0.2,
+                cache_write: 10.0,
+                cache_write_1h: 16.0,
+            },
+            Some(v) if v >= (5, 1) => ModelPricing {
+                input: 10.0,
+                output: 50.0,
+                cache_read: 0.25,
+                cache_write: 12.5,
+                cache_write_1h: 20.0,
+            },
+            _ => ModelPricing {
+                input: 10.0,
+                output: 50.0,
+                cache_read: 1.0,
+                cache_write: 12.5,
+                cache_write_1h: 20.0,
+            },
         }
     } else if matches!(family_version(model, "opus"), Some(v) if v >= (5, 5)) {
         // Opus 5.5: $4/$20, writes at the standard multipliers, reads at
@@ -185,23 +197,26 @@ pub fn pricing_for_entry(entry: &UsageEntry) -> ModelPricing {
 /// Flat fee per Anthropic web-search server-tool request ($10 per 1,000 = $0.01).
 pub const WEB_SEARCH_COST_PER_REQUEST: f64 = 0.01;
 
-/// Fast-mode (research preview) cost multiplier, applied to the entire token
-/// cost line when `usage.speed == "fast"`. Fast mode is Opus-only and its
-/// premium varies by version (confirmed Anthropic pricing, 2026-09):
+/// Fast-mode cost multiplier, applied to the entire token cost line when
+/// `usage.speed == "fast"`. The premium varies by model (confirmed Anthropic
+/// pricing, 2026-11):
 /// - Opus 4.6 / 4.7 fast: 6× ($30/$150 vs $5/$25)
 /// - Opus 4.8 / 5 fast:   2× ($10/$50 vs $5/$25)
 /// - Opus 5.5 fast:       2× ($8/$40 vs $4/$20)
+/// - Fable 5.2 fast:      2× ($16/$80 vs $8/$40)
 ///
 /// Caching multipliers stack on top of fast pricing, i.e. fast scales the whole
 /// per-token line (input, output, and the cache rates that derive from input).
 /// Unknown / unsupported models return 1.0 (no premium) so we never overcount
-/// on a guess — newer Opus releases default here until their multiplier is added.
-/// Fable has no fast-mode variant (fast is Opus-only) → 1.0.
+/// on a guess — newer releases default here until their multiplier is added.
+/// Fable 5 and 5.1 have no fast mode → 1.0.
 pub fn fast_multiplier_for_model(model: &str) -> f64 {
     if model.contains("opus-4-8") || model.contains("opus-5") {
         2.0
     } else if model.contains("opus-4-7") || model.contains("opus-4-6") {
         6.0
+    } else if family_version(model, "fable") == Some((5, 2)) {
+        2.0
     } else {
         1.0
     }
@@ -2022,17 +2037,29 @@ mod tests {
     }
 
     #[test]
-    fn fable_has_no_fast_premium() {
-        // Fast mode is Opus-only; an (unexpected) fast-tagged Fable turn must
-        // not be multiplied — never overcount on a guess.
+    fn fable_before_5_2_has_no_fast_premium() {
+        // Fable 5 and 5.1 have no fast mode; an (unexpected) fast-tagged turn
+        // must not be multiplied — never overcount on a guess.
         let fast = entry_for_cost("claude-fable-5", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
         assert!((cost_for_entry(&fast) - 10.0).abs() < 1e-6);
+        let fast51 = entry_for_cost("claude-fable-5-1", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&fast51) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fable_5_2_fast_doubles_the_token_line() {
+        // Fable 5.2 fast: $16/$80 against the standard $8/$40.
+        let input = entry_for_cost("claude-fable-5-2", 1_000_000, 0, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&input) - 16.0).abs() < 1e-6);
+        let output = entry_for_cost("claude-fable-5-2", 0, 1_000_000, 0, 0, 0, 0, Some("fast"));
+        assert!((cost_for_entry(&output) - 80.0).abs() < 1e-6);
     }
 
     #[test]
     fn fable_context_window_is_natively_1m() {
         // No `[1m]` suffix variant exists for Fable — 1M is the default.
         assert_eq!(context_window_for_model("claude-fable-5"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-fable-5-2"), 1_000_000);
         assert_eq!(context_window_for_model("claude-opus-4-8"), 200_000);
         assert_eq!(context_window_for_model("claude-opus-4-8[1m]"), 1_000_000);
     }
@@ -2072,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_multiplier_only_for_known_opus() {
+    fn fast_multiplier_only_for_known_models() {
         assert_eq!(fast_multiplier_for_model("claude-opus-4-8"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-4-7"), 6.0);
         assert_eq!(fast_multiplier_for_model("claude-opus-4-6"), 6.0);
@@ -2082,8 +2109,31 @@ mod tests {
         assert_eq!(fast_multiplier_for_model("claude-opus-5-5[1m]"), 2.0);
         assert_eq!(fast_multiplier_for_model("claude-sonnet-4-6"), 1.0);
         assert_eq!(fast_multiplier_for_model("claude-fable-5-1"), 1.0);
+        assert_eq!(fast_multiplier_for_model("claude-fable-5-2"), 2.0);
         // Unknown future model → no premium (never overcount on a guess).
         assert_eq!(fast_multiplier_for_model("claude-opus-6"), 1.0);
+        assert_eq!(fast_multiplier_for_model("claude-fable-5-3"), 1.0);
+    }
+
+    #[test]
+    fn fable_5_2_is_cheaper_than_fable_5_1() {
+        // Fable 5.2: $8 in / $40 out / $0.20 read (0.025× input) / $10
+        // 5m-write / $16 1h-write per MTok.
+        let input = entry_for_cost("claude-fable-5-2", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&input) - 8.0).abs() < 1e-6);
+        let output = entry_for_cost("claude-fable-5-2", 0, 1_000_000, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&output) - 40.0).abs() < 1e-6);
+        let read = entry_for_cost("claude-fable-5-2", 0, 0, 1_000_000, 0, 0, 0, None);
+        assert!((cost_for_entry(&read) - 0.2).abs() < 1e-6);
+        let w5m = entry_for_cost("claude-fable-5-2", 0, 0, 0, 1_000_000, 0, 0, None);
+        assert!((cost_for_entry(&w5m) - 10.0).abs() < 1e-6);
+        let w1h = entry_for_cost("claude-fable-5-2", 0, 0, 0, 1_000_000, 1_000_000, 0, None);
+        assert!((cost_for_entry(&w1h) - 16.0).abs() < 1e-6);
+        // A dated snapshot and a future Fable price as the newest known tier.
+        let dated = entry_for_cost("claude-fable-5-2-20261109", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&dated) - 8.0).abs() < 1e-6);
+        let future = entry_for_cost("claude-fable-5-3", 1_000_000, 0, 0, 0, 0, 0, None);
+        assert!((cost_for_entry(&future) - 8.0).abs() < 1e-6);
     }
 
     #[test]
